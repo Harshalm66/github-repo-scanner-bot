@@ -1,0 +1,102 @@
+name: Scan Repository
+
+on:
+  repository_dispatch:
+    types: [scan_command]
+  workflow_dispatch:  # for manual testing
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Extract repo URL
+        run: |
+          echo "REPO_URL=${{ github.event.client_payload.repo_url }}" >> $GITHUB_ENV
+
+      - name: Clone target repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.extract.outputs.repo_name }}
+          ref: main
+          path: target-repo
+
+      # Wait, better way:
+      - name: Clone any public repo
+        run: |
+          URL="${{ github.event.client_payload.repo_url }}"
+          REPO=$(echo $URL | sed 's/https:\/\/github.com\///' | sed 's/\.git$//')
+          git clone https://github.com/$REPO.git target-repo
+          cd target-repo
+          echo "Cloned $REPO"
+
+      # Run multiple OSS tools
+      - name: Run CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript, python, java, csharp, go, ruby
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+
+      - name: Run njsscan (Node.js)
+        if: success() || failure()
+        uses: ajinabomi/njsscan@v5
+        with:
+          args: target-repo --exit-warning --sarif -o njsscan.sarif
+
+      - name: Run Bandit (Python)
+        if: success() || failure()
+        run: |
+          pip install bandit
+          bandit -r target-repo -f json -o bandit-report.json || true
+
+      - name: Run Semgrep
+        uses: semgrep/semgrep-action@v1
+        with:
+          auditOn: build
+          config: auto
+          publishToken: ${{ secrets.SEMGREP_TOKEN }} # optional
+          generateSarif: "1"
+          output: semgrep.sarif
+
+      - name: Run Bearer (Secrets + SAST)
+        uses: Bearer/bearer-action@v2
+        with:
+          path: target-repo
+
+      - name: Run Trivy (SBOM + Secrets)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          format: 'table'
+          path: 'target-repo'
+
+      - name: Generate Final Report
+        run: |
+          echo "# Security & Quality Scan Report" > final-report.md
+          echo "Repository: ${{ github.event.client_payload.repo_url }}" >> final-report.md
+          echo "Scanned on: $(date)" >> final-report.md
+          echo "" >> final-report.md
+          
+          echo "## CodeQL Results" >> final-report.md
+          cat results-codeql/*.json | jq '.runs[0].results | length' || echo "No CodeQL issues or error"
+          
+          echo "## Semgrep Findings" >> final-report.md
+          if [ -f semgrep.sarif ]; then
+            cat semgrep.sarif | jq '.runs[0].results | length' >> final-report.md
+          fi
+          
+          echo "## Secrets Detected (Bearer/Trivy)" >> final-report.md
+          echo "Check artifacts for details" >> final-report.md
+          
+          echo "" >> final-report.md
+          echo "Full detailed reports in Artifacts ↓" >> final-report.md
+
+      - name: Upload Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-report-${{ github.run_number }}
+          path: |
+            final-report.md
+            *.sarif
+            *.json
+            *.txt
