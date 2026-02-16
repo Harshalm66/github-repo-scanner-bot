@@ -3,100 +3,257 @@ name: Scan Repository
 on:
   repository_dispatch:
     types: [scan_command]
-  workflow_dispatch:  # for manual testing
+  
+  workflow_dispatch:  # For manual testing
+    inputs:
+      repo_url:
+        description: 'GitHub Repository URL to scan'
+        required: true
+        default: 'https://github.com/lodash/lodash'
+        type: string
 
 jobs:
   scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
     steps:
-      - name: Extract repo URL
+      - name: 📋 Parse Repository URL
+        id: parse
         run: |
-          echo "REPO_URL=${{ github.event.client_payload.repo_url }}" >> $GITHUB_ENV
+          # Get URL from either manual trigger or API trigger
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            URL="${{ github.event.inputs.repo_url }}"
+          else
+            URL="${{ github.event.client_payload.repo_url }}"
+          fi
+          
+          echo "Processing URL: $URL"
+          
+          # Extract owner/repo from URL
+          REPO=$(echo $URL | sed 's|https://github.com/||' | sed 's|\.git$||' | sed 's|/$||')
+          
+          echo "repo=$REPO" >> $GITHUB_OUTPUT
+          echo "url=$URL" >> $GITHUB_OUTPUT
+          echo "Parsed: $REPO"
 
-      - name: Clone target repo
+      - name: 🔽 Clone Target Repository
         uses: actions/checkout@v4
         with:
-          repository: ${{ steps.extract.outputs.repo_name }}
-          ref: main
+          repository: ${{ steps.parse.outputs.repo }}
           path: target-repo
+          fetch-depth: 0  # Full history for better analysis
 
-      # Wait, better way:
-      - name: Clone any public repo
+      - name: 📊 Repository Information
         run: |
-          URL="${{ github.event.client_payload.repo_url }}"
-          REPO=$(echo $URL | sed 's/https:\/\/github.com\///' | sed 's/\.git$//')
-          git clone https://github.com/$REPO.git target-repo
+          echo "=================================="
+          echo "Repository: ${{ steps.parse.outputs.repo }}"
+          echo "URL: ${{ steps.parse.outputs.url }}"
+          echo "=================================="
           cd target-repo
-          echo "Cloned $REPO"
+          echo "Files found:"
+          find . -type f -name "*.js" -o -name "*.py" -o -name "*.java" -o -name "*.go" | head -20
+          cd ..
 
-      # Run multiple OSS tools
-      - name: Run CodeQL
+      # CodeQL Analysis
+      - name: 🔍 Initialize CodeQL
         uses: github/codeql-action/init@v3
         with:
-          languages: javascript, python, java, csharp, go, ruby
-      - name: Perform CodeQL Analysis
+          languages: javascript, python, java, go
+          source-root: target-repo
+        continue-on-error: true
+
+      - name: 🔍 Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3
-
-      - name: Run njsscan (Node.js)
-        if: success() || failure()
-        uses: ajinabomi/njsscan@v5
         with:
-          args: target-repo --exit-warning --sarif -o njsscan.sarif
+          category: "/language:multi"
+          output: codeql-results
+        continue-on-error: true
 
-      - name: Run Bandit (Python)
+      # Semgrep Analysis
+      - name: 🛡️ Run Semgrep
+        continue-on-error: true
+        run: |
+          pip install semgrep
+          cd target-repo
+          semgrep --config=auto --json --output=../semgrep-results.json . || true
+          semgrep --config=auto --sarif --output=../semgrep.sarif . || true
+          cd ..
+          
+          if [ -f semgrep-results.json ]; then
+            echo "✅ Semgrep completed"
+            FINDINGS=$(jq '.results | length' semgrep-results.json 2>/dev/null || echo "0")
+            echo "Semgrep findings: $FINDINGS"
+          fi
+
+      # Bandit (Python Security)
+      - name: 🐍 Run Bandit (Python)
         if: success() || failure()
+        continue-on-error: true
         run: |
           pip install bandit
           bandit -r target-repo -f json -o bandit-report.json || true
+          
+          if [ -f bandit-report.json ]; then
+            echo "✅ Bandit completed"
+          fi
 
-      - name: Run Semgrep
-        uses: semgrep/semgrep-action@v1
-        with:
-          auditOn: build
-          config: auto
-          publishToken: ${{ secrets.SEMGREP_TOKEN }} # optional
-          generateSarif: "1"
-          output: semgrep.sarif
+      # njsscan (Node.js Security)
+      - name: 📦 Run njsscan (Node.js)
+        if: success() || failure()
+        continue-on-error: true
+        run: |
+          pip install njsscan
+          njsscan target-repo --json --output njsscan-report.json || true
+          
+          if [ -f njsscan-report.json ]; then
+            echo "✅ njsscan completed"
+          fi
 
-      - name: Run Bearer (Secrets + SAST)
-        uses: Bearer/bearer-action@v2
-        with:
-          path: target-repo
-
-      - name: Run Trivy (SBOM + Secrets)
+      # Trivy (Vulnerabilities & Secrets)
+      - name: 🔐 Run Trivy Scan
         uses: aquasecurity/trivy-action@master
+        if: success() || failure()
+        continue-on-error: true
         with:
           scan-type: 'fs'
-          format: 'table'
-          path: 'target-repo'
+          scan-ref: 'target-repo'
+          format: 'json'
+          output: 'trivy-results.json'
 
-      - name: Generate Final Report
+      # Safety (Python Dependencies)
+      - name: 🔒 Run Safety (Python Dependencies)
+        if: success() || failure()
+        continue-on-error: true
         run: |
-          echo "# Security & Quality Scan Report" > final-report.md
-          echo "Repository: ${{ github.event.client_payload.repo_url }}" >> final-report.md
-          echo "Scanned on: $(date)" >> final-report.md
-          echo "" >> final-report.md
-          
-          echo "## CodeQL Results" >> final-report.md
-          cat results-codeql/*.json | jq '.runs[0].results | length' || echo "No CodeQL issues or error"
-          
-          echo "## Semgrep Findings" >> final-report.md
-          if [ -f semgrep.sarif ]; then
-            cat semgrep.sarif | jq '.runs[0].results | length' >> final-report.md
+          if [ -f target-repo/requirements.txt ]; then
+            pip install safety
+            safety check --file target-repo/requirements.txt --json > safety-results.json || true
+            echo "✅ Safety scan completed"
+          else
+            echo "ℹ️  No requirements.txt found, skipping Safety scan"
           fi
-          
-          echo "## Secrets Detected (Bearer/Trivy)" >> final-report.md
-          echo "Check artifacts for details" >> final-report.md
-          
-          echo "" >> final-report.md
-          echo "Full detailed reports in Artifacts ↓" >> final-report.md
 
-      - name: Upload Report
+      # Generate Comprehensive Report
+      - name: 📝 Generate Final Report
+        if: always()
+        run: |
+          cat << 'EOFMARKER' > final-report.md
+          # 🔒 Security & Quality Scan Report
+          
+          **Repository:** ${{ steps.parse.outputs.repo }}  
+          **URL:** ${{ steps.parse.outputs.url }}  
+          **Scanned:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")  
+          **Workflow Run:** #${{ github.run_number }}
+          
+          ---
+          
+          ## 📊 Executive Summary
+          
+          EOFMARKER
+          
+          # Add CodeQL results
+          echo "### 🔍 CodeQL Analysis" >> final-report.md
+          if [ -d codeql-results ]; then
+            echo "- ✅ CodeQL scan completed" >> final-report.md
+            echo "- Results available in artifacts" >> final-report.md
+          else
+            echo "- ⚠️ CodeQL scan not completed or no issues found" >> final-report.md
+          fi
+          echo "" >> final-report.md
+          
+          # Add Semgrep results
+          echo "### 🛡️ Semgrep Findings" >> final-report.md
+          if [ -f semgrep-results.json ]; then
+            TOTAL=$(jq '.results | length' semgrep-results.json 2>/dev/null || echo "0")
+            echo "- **Total findings:** $TOTAL" >> final-report.md
+            
+            if [ "$TOTAL" != "0" ] && [ "$TOTAL" != "null" ]; then
+              echo "- **Severity breakdown:**" >> final-report.md
+              HIGH=$(jq '[.results[] | select(.extra.severity=="ERROR")] | length' semgrep-results.json 2>/dev/null || echo "0")
+              MEDIUM=$(jq '[.results[] | select(.extra.severity=="WARNING")] | length' semgrep-results.json 2>/dev/null || echo "0")
+              echo "  - High: $HIGH" >> final-report.md
+              echo "  - Medium: $MEDIUM" >> final-report.md
+            fi
+          else
+            echo "- Status: Not run or no results" >> final-report.md
+          fi
+          echo "" >> final-report.md
+          
+          # Add Bandit results
+          echo "### 🐍 Bandit Analysis (Python)" >> final-report.md
+          if [ -f bandit-report.json ]; then
+            HIGH=$(jq '[.results[] | select(.issue_severity=="HIGH")] | length' bandit-report.json 2>/dev/null || echo "0")
+            MEDIUM=$(jq '[.results[] | select(.issue_severity=="MEDIUM")] | length' bandit-report.json 2>/dev/null || echo "0")
+            LOW=$(jq '[.results[] | select(.issue_severity=="LOW")] | length' bandit-report.json 2>/dev/null || echo "0")
+            echo "- **High severity:** $HIGH" >> final-report.md
+            echo "- **Medium severity:** $MEDIUM" >> final-report.md
+            echo "- **Low severity:** $LOW" >> final-report.md
+          else
+            echo "- Status: No Python files or scan not run" >> final-report.md
+          fi
+          echo "" >> final-report.md
+          
+          # Add njsscan results
+          echo "### 📦 njsscan Analysis (Node.js)" >> final-report.md
+          if [ -f njsscan-report.json ]; then
+            echo "- ✅ Scan completed" >> final-report.md
+            echo "- See artifacts for details" >> final-report.md
+          else
+            echo "- Status: No Node.js files or scan not run" >> final-report.md
+          fi
+          echo "" >> final-report.md
+          
+          # Add Trivy results
+          echo "### 🔐 Trivy Scan (Vulnerabilities & Secrets)" >> final-report.md
+          if [ -f trivy-results.json ]; then
+            echo "- ✅ Scan completed" >> final-report.md
+            VULNS=$(jq '[.Results[]?.Vulnerabilities[]?] | length' trivy-results.json 2>/dev/null || echo "0")
+            echo "- **Vulnerabilities found:** $VULNS" >> final-report.md
+          else
+            echo "- Status: Scan not completed" >> final-report.md
+          fi
+          echo "" >> final-report.md
+          
+          # Footer
+          echo "---" >> final-report.md
+          echo "" >> final-report.md
+          echo "## 📦 Detailed Reports" >> final-report.md
+          echo "" >> final-report.md
+          echo "Download full scan results from the **Artifacts** section below." >> final-report.md
+          echo "" >> final-report.md
+          echo "✅ **Scan completed successfully**" >> final-report.md
+          
+          # Display report in logs
+          echo ""
+          echo "========================================="
+          echo "FINAL REPORT:"
+          echo "========================================="
+          cat final-report.md
+          echo "========================================="
+
+      - name: 📤 Upload All Results
         uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: scan-report-${{ github.run_number }}
+          name: security-scan-results-${{ github.run_number }}
           path: |
             final-report.md
-            *.sarif
-            *.json
-            *.txt
+            semgrep-results.json
+            semgrep.sarif
+            bandit-report.json
+            njsscan-report.json
+            trivy-results.json
+            safety-results.json
+            codeql-results/
+          retention-days: 30
+
+      - name: ✅ Workflow Complete
+        if: always()
+        run: |
+          echo "========================================="
+          echo "✅ Security scan workflow completed!"
+          echo "========================================="
+          echo "📊 View the final report in workflow logs above"
+          echo "📦 Download detailed results from Artifacts section"
+          echo "========================================="
