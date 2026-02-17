@@ -2,7 +2,7 @@ name: Scan Repository
 
 on:
   repository_dispatch:
-    types: [scan_command]
+    types: [process-url]
   
   workflow_dispatch:
     inputs:
