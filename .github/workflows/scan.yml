@@ -628,3 +628,6 @@ jobs:
           echo ""
           echo "🎯 View summary report in the logs above"
           echo "============================================="
+      - name: Output Run ID
+        run: |
+          echo "The current Run ID is ${{ github.run_id }}"
