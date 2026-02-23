@@ -642,6 +642,32 @@ jobs:
             safety-results.json
             npm-audit.json
           retention-days: 30
+      
+      - name: Send JSON result to agent
+        if: |
+          always() &&
+          github.event_name == 'repository_dispatch' &&
+          github.event.client_payload.callback_url != ''
+        run: |
+          cat > result.json << JSON
+          {
+            "request_id":     "${{ github.event.client_payload.request_id }}",
+            "status":         "${{ job.status }}",
+            "run_url":        "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+            "artifact":       "security-scan-results-${{ github.run_number }}",
+            "critical":       "${TOTAL_CRITICAL:-0}",
+            "high":           "${TOTAL_HIGH:-0}",
+            "medium":         "${TOTAL_MEDIUM:-0}",
+            "low":            "${TOTAL_LOW:-0}",
+            "secrets":        "${TOTAL_SECRETS:-0}",
+            "total_issues":   "${TOTAL_ISSUES:-0}",
+            "short_report":   $(head -n 30 final-report.md | jq -Rs . || echo "Summary not available")
+          }
+          JSON
+
+          curl -X POST "${{ github.event.client_payload.callback_url }}" \
+            -H "Content-Type: application/json" \
+            -d @result.json || echo "Callback failed"
 
       - name: ✅ Workflow Summary
         if: always()
@@ -670,28 +696,3 @@ jobs:
         run: |
           echo "## Scan Summary for Agent" >> $GITHUB_STEP_SUMMARY
           cat final-report.md >> $GITHUB_STEP_SUMMARY
-      - name: Send JSON result to agent
-        if: |
-          always() &&
-          github.event_name == 'repository_dispatch' &&
-          github.event.client_payload.callback_url != ''
-        run: |
-          cat > result.json << JSON
-          {
-            "request_id":     "${{ github.event.client_payload.request_id }}",
-            "status":         "${{ job.status }}",
-            "run_url":        "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}",
-            "artifact":       "security-scan-results-${{ github.run_number }}",
-            "critical":       "${TOTAL_CRITICAL:-0}",
-            "high":           "${TOTAL_HIGH:-0}",
-            "medium":         "${TOTAL_MEDIUM:-0}",
-            "low":            "${TOTAL_LOW:-0}",
-            "secrets":        "${TOTAL_SECRETS:-0}",
-            "total_issues":   "${TOTAL_ISSUES:-0}",
-            "short_report":   $(head -n 30 final-report.md | jq -Rs . || echo "Summary not available")
-          }
-          JSON
-
-          curl -X POST "${{ github.event.client_payload.callback_url }}" \
-            -H "Content-Type: application/json" \
-            -d @result.json || echo "Callback failed"
