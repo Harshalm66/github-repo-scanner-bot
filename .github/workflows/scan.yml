@@ -3,11 +3,11 @@ name: Scan Repository
 on:
   repository_dispatch:
     types: [process-url]
-  
+ 
   workflow_dispatch:
     inputs:
       repo_url:
-        description: 'GitHub Repository URL to scan'
+        description: 'GitHub Repository URL or owner/repo (https://github.com/owner/repo  or  owner/repo)'
         required: true
         default: 'https://github.com/lodash/lodash'
         type: string
@@ -16,26 +16,67 @@ jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    
+   
     steps:
       - name: 📋 Parse Repository URL
         id: parse
         run: |
-          # Get URL from either manual trigger or API trigger
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            URL="${{ github.event.inputs.repo_url }}"
+          # ────────────────────────────────────────────────
+          # Get input URL (from manual trigger or dispatch)
+          # ────────────────────────────────────────────────
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            INPUT_URL="${{ github.event.inputs.repo_url }}"
           else
-            URL="${{ github.event.client_payload.repo_url }}"
+            INPUT_URL="${{ github.event.client_payload.repo_url }}"
           fi
-          
-          echo "Processing URL: $URL"
-          
-          # Extract owner/repo from URL
-          REPO=$(echo $URL | sed 's|https://github.com/||' | sed 's|\.git$||' | sed 's|/$||')
-          
-          echo "repo=$REPO" >> $GITHUB_OUTPUT
-          echo "url=$URL" >> $GITHUB_OUTPUT
-          echo "✅ Parsed repository: $REPO"
+
+          echo "Input URL: $INPUT_URL"
+
+          # ────────────────────────────────────────────────
+          # Robust parsing: extract owner/repo
+          # Handles:
+          #   https://github.com/owner/repo
+          #   https://github.com/owner/repo.git
+          #   https://github.com/owner/repo/
+          #   owner/repo
+          #   owner/repo.git
+          #   owner (will be caught by validation)
+          # ────────────────────────────────────────────────
+          CLEAN=$(echo "$INPUT_URL" \
+            | sed -E 's#^https?://(www\.)?github\.com/##' \
+            | sed -E 's#\.git$##' \
+            | sed -E 's#/+$##' \
+            | sed -E 's#/$##')
+
+          OWNER=$(echo "$CLEAN" | cut -d'/' -f1)
+          REPO_NAME=$(echo "$CLEAN" | cut -d'/' -f2 -s)
+
+          if [ -n "$REPO_NAME" ]; then
+            REPO="$OWNER/$REPO_NAME"
+          else
+            REPO="$OWNER"
+          fi
+
+          # ────────────────────────────────────────────────
+          # Validation - fail early with clear message
+          # ────────────────────────────────────────────────
+          if [[ ! "$REPO" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]+/[a-zA-Z0-9._-]+$ ]]; then
+            echo "❌ Invalid GitHub repository format"
+            echo "  Got: '$REPO'"
+            echo "  Expected: owner/repository  (e.g. lodash/lodash, octocat/hello-world)"
+            echo ""
+            echo "Please provide a full repository path like:"
+            echo "  • https://github.com/owner/repo"
+            echo "  • owner/repo"
+            exit 1
+          fi
+
+          echo "repo=$REPO"           >> $GITHUB_OUTPUT
+          echo "url=$INPUT_URL"       >> $GITHUB_OUTPUT
+          echo "owner=$OWNER"         >> $GITHUB_OUTPUT
+          echo "repo_name=$REPO_NAME" >> $GITHUB_OUTPUT
+
+          echo "✅ Parsed → $REPO"
 
       - name: 🔽 Clone Target Repository
         uses: actions/checkout@v4
@@ -48,18 +89,18 @@ jobs:
         run: |
           echo "============================================="
           echo "Repository: ${{ steps.parse.outputs.repo }}"
-          echo "URL: ${{ steps.parse.outputs.url }}"
+          echo "URL:        ${{ steps.parse.outputs.url }}"
           echo "============================================="
           cd target-repo
-          
+         
           echo ""
           echo "📁 Repository structure:"
           ls -la | head -20
-          
+         
           echo ""
           echo "📝 File types detected:"
           find . -type f | sed 's/.*\.//' | sort | uniq -c | sort -rn | head -15
-          
+         
           echo ""
           echo "📦 Total files: $(find . -type f | wc -l)"
           echo "============================================="
@@ -70,67 +111,66 @@ jobs:
         run: |
           cd target-repo
           LANGUAGES=""
-          
+
           echo "Detecting languages..."
           echo ""
-          
-          # Check for JavaScript/TypeScript
+
+          # JavaScript/TypeScript
           if find . -name "*.js" -o -name "*.ts" -o -name "*.jsx" -o -name "*.tsx" | grep -q .; then
             LANGUAGES="$LANGUAGES javascript"
             JS_COUNT=$(find . -name "*.js" -o -name "*.ts" -o -name "*.jsx" -o -name "*.tsx" | wc -l)
             echo "✅ JavaScript/TypeScript detected ($JS_COUNT files)"
           fi
-          
-          # Check for Python
+
+          # Python
           if find . -name "*.py" | grep -q .; then
             LANGUAGES="$LANGUAGES python"
             PY_COUNT=$(find . -name "*.py" | wc -l)
             echo "✅ Python detected ($PY_COUNT files)"
           fi
-          
-          # Check for Java
+
+          # Java
           if find . -name "*.java" | grep -q .; then
             LANGUAGES="$LANGUAGES java"
             JAVA_COUNT=$(find . -name "*.java" | wc -l)
             echo "✅ Java detected ($JAVA_COUNT files)"
           fi
-          
-          # Check for Go
+
+          # Go
           if find . -name "*.go" | grep -q .; then
             LANGUAGES="$LANGUAGES go"
             GO_COUNT=$(find . -name "*.go" | wc -l)
             echo "✅ Go detected ($GO_COUNT files)"
           fi
-          
-          # Check for C/C++
+
+          # C/C++
           if find . -name "*.c" -o -name "*.cpp" -o -name "*.h" -o -name "*.hpp" | grep -q .; then
             LANGUAGES="$LANGUAGES cpp"
             CPP_COUNT=$(find . -name "*.c" -o -name "*.cpp" -o -name "*.h" | wc -l)
             echo "✅ C/C++ detected ($CPP_COUNT files)"
           fi
-          
-          # Check for C#
+
+          # C#
           if find . -name "*.cs" | grep -q .; then
             LANGUAGES="$LANGUAGES csharp"
             CS_COUNT=$(find . -name "*.cs" | wc -l)
             echo "✅ C# detected ($CS_COUNT files)"
           fi
-          
-          # Check for Ruby
+
+          # Ruby
           if find . -name "*.rb" | grep -q .; then
             LANGUAGES="$LANGUAGES ruby"
             RB_COUNT=$(find . -name "*.rb" | wc -l)
             echo "✅ Ruby detected ($RB_COUNT files)"
           fi
-          
+
           cd ..
-          
-          # Clean up extra spaces
+
           LANGUAGES=$(echo $LANGUAGES | xargs)
-          
+
           if [ -z "$LANGUAGES" ]; then
             echo ""
-            echo "⚠️  No CodeQL-supported languages detected"
+            echo "⚠️ No CodeQL-supported languages detected"
             echo "languages=none" >> $GITHUB_OUTPUT
           else
             echo ""
@@ -138,7 +178,6 @@ jobs:
             echo "languages=$LANGUAGES" >> $GITHUB_OUTPUT
           fi
 
-      # CodeQL Analysis (only if supported languages detected)
       - name: 🔍 Initialize CodeQL
         if: steps.detect-languages.outputs.languages != 'none'
         uses: github/codeql-action/init@v3
@@ -154,29 +193,25 @@ jobs:
           category: "/language:${{ steps.detect-languages.outputs.languages }}"
         continue-on-error: true
 
-      # Semgrep - Universal SAST
       - name: 🛡️ Run Semgrep (Universal SAST)
         continue-on-error: true
         run: |
           echo "Installing Semgrep..."
           pip install semgrep
-          
+         
           echo "Running Semgrep scan..."
           cd target-repo
-          
-          # Run with JSON output
+         
           semgrep --config=auto --json --output=../semgrep-results.json . || true
-          
-          # Run with SARIF output for GitHub integration
           semgrep --config=auto --sarif --output=../semgrep.sarif . || true
-          
+         
           cd ..
-          
+         
           if [ -f semgrep-results.json ]; then
             FINDINGS=$(jq '.results | length' semgrep-results.json 2>/dev/null || echo "0")
             echo "✅ Semgrep completed: $FINDINGS findings"
           else
-            echo "⚠️  Semgrep completed with warnings"
+            echo "⚠️ Semgrep completed with warnings"
           fi
 
       # Bandit - Python Security
