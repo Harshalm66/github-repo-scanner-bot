@@ -696,3 +696,6 @@ jobs:
         run: |
           echo "## Scan Summary for Agent" >> $GITHUB_STEP_SUMMARY
           cat final-report.md >> $GITHUB_STEP_SUMMARY
+      - name: Output call back url ID
+        run: |
+          echo "The current callback url is ${{ github.event.client_payload.callback_url }}"
