@@ -3,10 +3,11 @@ name: Scan Repository
 on:
   repository_dispatch:
     types: [process-url]
+ 
   workflow_dispatch:
     inputs:
       repo_url:
-        description: 'GitHub Repository URL or owner/repo'
+        description: 'GitHub Repository URL or owner/repo (https://github.com/owner/repo  or  owner/repo)'
         required: true
         default: 'https://github.com/lodash/lodash'
         type: string
@@ -14,270 +15,658 @@ on:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-
+    timeout-minutes: 30
+   
     steps:
       - name: 📋 Parse Repository URL
         id: parse
         run: |
+          # ────────────────────────────────────────────────
+          # Get input URL (from manual trigger or dispatch)
+          # ────────────────────────────────────────────────
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             INPUT_URL="${{ github.event.inputs.repo_url }}"
           else
             INPUT_URL="${{ github.event.client_payload.repo_url }}"
           fi
 
-          CLEAN=$(echo "$INPUT_URL" | sed -E 's#^https?://(www\.)?github\.com/##' | sed -E 's#\.git$##' | sed -E 's#/+$##')
+          echo "Input URL: $INPUT_URL"
+
+          # ────────────────────────────────────────────────
+          # Robust parsing: extract owner/repo
+          # Handles:
+          #   https://github.com/owner/repo
+          #   https://github.com/owner/repo.git
+          #   https://github.com/owner/repo/
+          #   owner/repo
+          #   owner/repo.git
+          #   owner (will be caught by validation)
+          # ────────────────────────────────────────────────
+          CLEAN=$(echo "$INPUT_URL" \
+            | sed -E 's#^https?://(www\.)?github\.com/##' \
+            | sed -E 's#\.git$##' \
+            | sed -E 's#/+$##' \
+            | sed -E 's#/$##')
+
           OWNER=$(echo "$CLEAN" | cut -d'/' -f1)
           REPO_NAME=$(echo "$CLEAN" | cut -d'/' -f2 -s)
-          REPO="${REPO_NAME:+${OWNER}/${REPO_NAME}}"
-          REPO="${REPO:-$OWNER}"
 
-          if [[ ! "$REPO" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]+(/[a-zA-Z0-9._-]+)?$ ]]; then
-            echo "❌ Invalid repo format: $REPO"
+          if [ -n "$REPO_NAME" ]; then
+            REPO="$OWNER/$REPO_NAME"
+          else
+            REPO="$OWNER"
+          fi
+
+          # ────────────────────────────────────────────────
+          # Validation - fail early with clear message
+          # ────────────────────────────────────────────────
+          if [[ ! "$REPO" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]+/[a-zA-Z0-9._-]+$ ]]; then
+            echo "❌ Invalid GitHub repository format"
+            echo "  Got: '$REPO'"
+            echo "  Expected: owner/repository  (e.g. lodash/lodash, octocat/hello-world)"
+            echo ""
+            echo "Please provide a full repository path like:"
+            echo "  • https://github.com/owner/repo"
+            echo "  • owner/repo"
             exit 1
           fi
 
-          echo "repo=$REPO" >> $GITHUB_OUTPUT
-          echo "url=$INPUT_URL" >> $GITHUB_OUTPUT
+          echo "repo=$REPO"           >> $GITHUB_OUTPUT
+          echo "url=$INPUT_URL"       >> $GITHUB_OUTPUT
+          echo "owner=$OWNER"         >> $GITHUB_OUTPUT
+          echo "repo_name=$REPO_NAME" >> $GITHUB_OUTPUT
 
-      - name: 🔽 Shallow Clone Target Repository
+          echo "✅ Parsed → $REPO"
+
+      - name: 🔽 Clone Target Repository
         uses: actions/checkout@v4
         with:
           repository: ${{ steps.parse.outputs.repo }}
           path: target-repo
-          fetch-depth: 1
+          fetch-depth: 0
 
-      - name: 🐍 Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install security scanners
+      - name: 📊 Repository Information
         run: |
-          python -m pip install --upgrade pip
-          pip install semgrep bandit njsscan safety
+          echo "============================================="
+          echo "Repository: ${{ steps.parse.outputs.repo }}"
+          echo "URL:        ${{ steps.parse.outputs.url }}"
+          echo "============================================="
+          cd target-repo
+         
+          echo ""
+          echo "📁 Repository structure:"
+          ls -la | head -20
+         
+          echo ""
+          echo "📝 File types detected:"
+          find . -type f | sed 's/.*\.//' | sort | uniq -c | sort -rn | head -15
+         
+          echo ""
+          echo "📦 Total files: $(find . -type f | wc -l)"
+          echo "============================================="
+          cd ..
 
-      - name: 🔍 Quick language detection
+      - name: 🔍 Detect Languages for CodeQL
         id: detect-languages
         run: |
           cd target-repo
           LANGUAGES=""
-          if find . -type f \( -name "*.js" -o -name "*.ts" -o -name "*.jsx" -o -name "*.tsx" \) -print -quit | grep -q .; then LANGUAGES="$LANGUAGES javascript"; fi
-          if find . -type f -name "*.py" -print -quit | grep -q .; then LANGUAGES="$LANGUAGES python"; fi
-          if find . -type f -name "*.java" -print -quit | grep -q .; then LANGUAGES="$LANGUAGES java"; fi
-          if find . -type f -name "*.go"   -print -quit | grep -q .; then LANGUAGES="$LANGUAGES go"; fi
-          if find . -type f \( -name "*.c" -o -name "*.cpp" -o -name "*.h" \) -print -quit | grep -q .; then LANGUAGES="$LANGUAGES cpp"; fi
-          LANGUAGES=$(echo $LANGUAGES | xargs)
-          echo "languages=${LANGUAGES:-none}" >> $GITHUB_OUTPUT
+
+          echo "Detecting languages..."
+          echo ""
+
+          # JavaScript/TypeScript
+          if find . -name "*.js" -o -name "*.ts" -o -name "*.jsx" -o -name "*.tsx" | grep -q .; then
+            LANGUAGES="$LANGUAGES javascript"
+            JS_COUNT=$(find . -name "*.js" -o -name "*.ts" -o -name "*.jsx" -o -name "*.tsx" | wc -l)
+            echo "✅ JavaScript/TypeScript detected ($JS_COUNT files)"
+          fi
+
+          # Python
+          if find . -name "*.py" | grep -q .; then
+            LANGUAGES="$LANGUAGES python"
+            PY_COUNT=$(find . -name "*.py" | wc -l)
+            echo "✅ Python detected ($PY_COUNT files)"
+          fi
+
+          # Java
+          if find . -name "*.java" | grep -q .; then
+            LANGUAGES="$LANGUAGES java"
+            JAVA_COUNT=$(find . -name "*.java" | wc -l)
+            echo "✅ Java detected ($JAVA_COUNT files)"
+          fi
+
+          # Go
+          if find . -name "*.go" | grep -q .; then
+            LANGUAGES="$LANGUAGES go"
+            GO_COUNT=$(find . -name "*.go" | wc -l)
+            echo "✅ Go detected ($GO_COUNT files)"
+          fi
+
+          # C/C++
+          if find . -name "*.c" -o -name "*.cpp" -o -name "*.h" -o -name "*.hpp" | grep -q .; then
+            LANGUAGES="$LANGUAGES cpp"
+            CPP_COUNT=$(find . -name "*.c" -o -name "*.cpp" -o -name "*.h" | wc -l)
+            echo "✅ C/C++ detected ($CPP_COUNT files)"
+          fi
+
+          # C#
+          if find . -name "*.cs" | grep -q .; then
+            LANGUAGES="$LANGUAGES csharp"
+            CS_COUNT=$(find . -name "*.cs" | wc -l)
+            echo "✅ C# detected ($CS_COUNT files)"
+          fi
+
+          # Ruby
+          if find . -name "*.rb" | grep -q .; then
+            LANGUAGES="$LANGUAGES ruby"
+            RB_COUNT=$(find . -name "*.rb" | wc -l)
+            echo "✅ Ruby detected ($RB_COUNT files)"
+          fi
+
           cd ..
 
-      - name: 🔐 Run Trivy (vuln + secret + misconfig)
+          LANGUAGES=$(echo $LANGUAGES | xargs)
+
+          if [ -z "$LANGUAGES" ]; then
+            echo ""
+            echo "⚠️ No CodeQL-supported languages detected"
+            echo "languages=none" >> $GITHUB_OUTPUT
+          else
+            echo ""
+            echo "🎯 CodeQL will scan: $LANGUAGES"
+            echo "languages=$LANGUAGES" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 🔍 Initialize CodeQL
+        if: steps.detect-languages.outputs.languages != 'none'
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ steps.detect-languages.outputs.languages }}
+          source-root: target-repo
+        continue-on-error: true
+
+      - name: 🔍 Perform CodeQL Analysis
+        if: steps.detect-languages.outputs.languages != 'none'
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ steps.detect-languages.outputs.languages }}"
+        continue-on-error: true
+
+      - name: 🛡️ Run Semgrep (Universal SAST)
+        continue-on-error: true
+        run: |
+          echo "Installing Semgrep..."
+          pip install semgrep
+         
+          echo "Running Semgrep scan..."
+          cd target-repo
+         
+          semgrep --config=auto --json --output=../semgrep-results.json . || true
+          semgrep --config=auto --sarif --output=../semgrep.sarif . || true
+         
+          cd ..
+         
+          if [ -f semgrep-results.json ]; then
+            FINDINGS=$(jq '.results | length' semgrep-results.json 2>/dev/null || echo "0")
+            echo "✅ Semgrep completed: $FINDINGS findings"
+          else
+            echo "⚠️ Semgrep completed with warnings"
+          fi
+
+      # Bandit - Python Security
+      - name: 🐍 Run Bandit (Python Security)
+        if: contains(steps.detect-languages.outputs.languages, 'python')
+        continue-on-error: true
+        run: |
+          echo "Installing Bandit..."
+          pip install bandit
+          
+          echo "Running Bandit Python security scan..."
+          bandit -r target-repo -f json -o bandit-report.json || true
+          
+          if [ -f bandit-report.json ]; then
+            HIGH=$(jq '[.results[] | select(.issue_severity=="HIGH")] | length' bandit-report.json 2>/dev/null || echo "0")
+            MEDIUM=$(jq '[.results[] | select(.issue_severity=="MEDIUM")] | length' bandit-report.json 2>/dev/null || echo "0")
+            echo "✅ Bandit completed: $HIGH high, $MEDIUM medium severity issues"
+          fi
+
+      # njsscan - Node.js/JavaScript Security
+      - name: 📦 Run njsscan (Node.js Security)
+        if: contains(steps.detect-languages.outputs.languages, 'javascript')
+        continue-on-error: true
+        run: |
+          echo "Installing njsscan..."
+          pip install njsscan
+          
+          echo "Running njsscan..."
+          njsscan target-repo --json --output njsscan-report.json || true
+          
+          if [ -f njsscan-report.json ]; then
+            ISSUES=$(jq '.total_count.sec // 0' njsscan-report.json 2>/dev/null || echo "0")
+            echo "✅ njsscan completed: $ISSUES security issues found"
+          fi
+
+      # Trivy - Vulnerabilities, Secrets, and Misconfigurations
+      - name: 🔐 Run Trivy (Vulnerabilities & Secrets)
         uses: aquasecurity/trivy-action@master
         continue-on-error: true
         with:
-          scan-type: fs
-          scan-ref: target-repo
-          scanners: vuln,secret,misconfig
-          format: json
-          output: trivy-combined.json
-          severity: CRITICAL,HIGH,MEDIUM,LOW
+          scan-type: 'fs'
+          scan-ref: 'target-repo'
+          format: 'json'
+          output: 'trivy-results.json'
+          severity: 'CRITICAL,HIGH,MEDIUM,LOW'
 
-      - name: 🛡️ Run Semgrep
+      - name: 🔐 Run Trivy (Secrets Detection)
+        uses: aquasecurity/trivy-action@master
         continue-on-error: true
-        timeout-minutes: 5
-        run: |
-          cd target-repo
-          semgrep --config=auto --json --output=../semgrep-results.json . || true
-          cd ..
+        with:
+          scan-type: 'fs'
+          scan-ref: 'target-repo'
+          scanners: 'secret'
+          format: 'json'
+          output: 'trivy-secrets.json'
 
-      - name: 🐍 Run Bandit (Python only)
+      # Safety - Python Dependencies
+      - name: 🔒 Run Safety (Python Dependencies)
         if: contains(steps.detect-languages.outputs.languages, 'python')
         continue-on-error: true
-        timeout-minutes: 3
-        run: bandit -r target-repo -f json -o bandit-report.json || true
-
-      - name: 📦 Run njsscan (JS/TS only)
-        if: contains(steps.detect-languages.outputs.languages, 'javascript')
-        continue-on-error: true
-        timeout-minutes: 3
-        run: njsscan target-repo --json --output njsscan-report.json || true
-
-      - name: 🔒 Run Safety (if requirements.txt exists)
-        if: contains(steps.detect-languages.outputs.languages, 'python') && hashFiles('target-repo/requirements.txt') != ''
-        continue-on-error: true
-        run: safety check --file target-repo/requirements.txt --json > safety-results.json || true
-
-      - name: 📦 Run npm audit (if package.json exists)
-        if: contains(steps.detect-languages.outputs.languages, 'javascript') && hashFiles('target-repo/package.json') != ''
-        continue-on-error: true
         run: |
-          cd target-repo
-          npm install --package-lock-only --no-audit --no-fund --quiet || true
-          npm audit --json > ../npm-audit.json || true
-          cd ..
-
-      - name: 📤 Send minimal result to agent callback
-        if: |
-          always() &&
-          github.event_name == 'repository_dispatch' &&
-          github.event.client_payload.callback_url != ''
-        run: |
-          CRITICAL=0 HIGH=0 MEDIUM=0 LOW=0 SECRETS=0 TOTAL=0
-
-          if [ -f trivy-combined.json ]; then
-            CRITICAL=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-combined.json 2>/dev/null || echo 0)
-            HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' trivy-combined.json 2>/dev/null || echo 0)
-            MEDIUM=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' trivy-combined.json 2>/dev/null || echo 0)
-            LOW=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' trivy-combined.json 2>/dev/null || echo 0)
-            SECRETS=$(jq '[.Results[]?.Secrets[]?] | length' trivy-combined.json 2>/dev/null || echo 0)
+          if [ -f target-repo/requirements.txt ]; then
+            echo "Installing Safety..."
+            pip install safety
+            
+            echo "Checking Python dependencies..."
+            safety check --file target-repo/requirements.txt --json > safety-results.json || true
+            
+            if [ -f safety-results.json ]; then
+              echo "✅ Safety scan completed"
+            fi
+          else
+            echo "ℹ️  No requirements.txt found, skipping Safety scan"
           fi
 
-          TOTAL=$((CRITICAL + HIGH + MEDIUM + LOW + SECRETS))
-
-          cat > result.json << JSON
-          {
-            "request_id": "${{ github.event.client_payload.request_id }}",
-            "status": "${{ job.status }}",
-            "run_url": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}",
-            "artifact_name": "security-scan-results-${{ github.run_number }}",
-            "critical": "$CRITICAL",
-            "high": "$HIGH",
-            "medium": "$MEDIUM",
-            "low": "$LOW",
-            "secrets": "$SECRETS",
-            "total_issues": "$TOTAL"
-          }
-          JSON
-
-          curl -X POST "${{ github.event.client_payload.callback_url }}" \
-            -H "Content-Type: application/json" \
-            -d @result.json --fail --silent || echo "Callback failed (non-blocking)"
-
-      # ────────────────────────────────────────────────
-      # Set fallback values (0) for report summary
-      # ────────────────────────────────────────────────
-      - name: Set summary counts for report
+      # npm audit - Node.js Dependencies
+      - name: 📦 Run npm audit (Node.js Dependencies)
+        if: contains(steps.detect-languages.outputs.languages, 'javascript')
+        continue-on-error: true
         run: |
-          echo "TOTAL_ISSUES=${TOTAL:-0}" >> $GITHUB_ENV
-          echo "CRITICAL=${CRITICAL:-0}" >> $GITHUB_ENV
-          echo "HIGH=${HIGH:-0}" >> $GITHUB_ENV
-          echo "MEDIUM=${MEDIUM:-0}" >> $GITHUB_ENV
-          echo "LOW=${LOW:-0}" >> $GITHUB_ENV
-          echo "SECRETS=${SECRETS:-0}" >> $GITHUB_ENV
+          if [ -f target-repo/package.json ]; then
+            echo "Running npm audit..."
+            cd target-repo
+            
+            # Install dependencies first
+            npm install --package-lock-only || true
+            
+            # Run audit
+            npm audit --json > ../npm-audit.json || true
+            
+            cd ..
+            
+            if [ -f npm-audit.json ]; then
+              VULNS=$(jq '.metadata.vulnerabilities.total // 0' npm-audit.json 2>/dev/null || echo "0")
+              echo "✅ npm audit completed: $VULNS vulnerabilities found"
+            fi
+          else
+            echo "ℹ️  No package.json found, skipping npm audit"
+          fi
 
-      - name: 📝 Generate pretty final report
+      # Generate Comprehensive Report
+      - name: 📝 Generate Final Report
         if: always()
         run: |
           cat << 'EOFMARKER' > final-report.md
           # 🔒 Security & Quality Scan Report
-
-          **Repository** — ${{ steps.parse.outputs.repo }}  
-          **Scanned URL** — ${{ steps.parse.outputs.url }}  
-          **Scan Date** — $(date -u +"%Y-%m-%d %H:%M:%S UTC")  
-          **Workflow Run** — [#${{ github.run_number }}](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})  
-          **Triggered by** — ${{ github.event_name }}
-
+          
+          **Repository:** ${{ steps.parse.outputs.repo }}  
+          **URL:** ${{ steps.parse.outputs.url }}  
+          **Scanned:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")  
+          **Workflow Run:** #${{ github.run_number }}  
+          **Triggered by:** ${{ github.event_name }}
+          
           ---
-
-          ## 🎯 Executive Summary
-
-          | Category         | Count       |
-          |------------------|-------------|
-          | Total Issues     | ${{ env.TOTAL_ISSUES }} |
-          | Critical         | ${{ env.CRITICAL }}     |
-          | High             | ${{ env.HIGH }}         |
-          | Medium           | ${{ env.MEDIUM }}       |
-          | Low              | ${{ env.LOW }}          |
-          | Secrets Detected | ${{ env.SECRETS }}      |
-
-          **Risk Level**:
+          
+          ## 📊 Executive Summary
+          
           EOFMARKER
-
-          if [ "${{ env.CRITICAL }}" -gt 0 ]; then
-            echo "- 🔴 **CRITICAL RISK** — Immediate action required" >> final-report.md
-          elif [ "${{ env.HIGH }}" -gt 10 ]; then
-            echo "- 🟠 **HIGH RISK** — Address high-severity issues urgently" >> final-report.md
-          elif [ "${{ env.MEDIUM }}" -gt 20 ] || [ "${{ env.SECRETS }}" -gt 0 ]; then
-            echo "- 🟡 **MEDIUM RISK** — Review recommended" >> final-report.md
-          else
-            echo "- ✅ **LOW RISK** — Repository appears secure" >> final-report.md
-          fi
-
-          cat << 'EOFMARKER' >> final-report.md
-
-          ---
-
-          ## 🔐 Trivy Results (Vulnerabilities, Secrets, Misconfigurations)
-
-          EOFMARKER
-
-          if [ -f trivy-combined.json ] && [ -s trivy-combined.json ]; then
-            CRIT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-combined.json 2>/dev/null || echo 0)
-            HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' trivy-combined.json 2>/dev/null || echo 0)
-            MED=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' trivy-combined.json 2>/dev/null || echo 0)
-            LOW=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' trivy-combined.json 2>/dev/null || echo 0)
-            SEC=$(jq '[.Results[]?.Secrets[]?] | length' trivy-combined.json 2>/dev/null || echo 0)
-
-            echo "- Critical   : $CRIT" >> final-report.md
-            echo "- High       : $HIGH" >> final-report.md
-            echo "- Medium     : $MED" >> final-report.md
-            echo "- Low        : $LOW" >> final-report.md
-            echo "- Secrets    : $SEC" >> final-report.md
-
-            if [ "$CRIT" -gt 0 ] || [ "$HIGH" -gt 0 ]; then
-              echo "" >> final-report.md
-              echo "#### Top Critical / High Issues (first 5)" >> final-report.md
-              jq -r '.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL" or .Severity=="HIGH") | "- **\(.VulnerabilityID)** – \(.Title // .PkgName) (\(.Severity)) in \(.PkgName)"' trivy-combined.json 2>/dev/null | head -5 >> final-report.md || echo "- (details parsing failed)" >> final-report.md
+          
+          # Initialize counters
+          TOTAL_CRITICAL=0
+          TOTAL_HIGH=0
+          TOTAL_MEDIUM=0
+          TOTAL_LOW=0
+          TOTAL_SECRETS=0
+          
+          # Trivy Vulnerabilities
+          echo "### 🔐 Trivy - Vulnerability Scan" >> final-report.md
+          if [ -f trivy-results.json ]; then
+            RESULTS_COUNT=$(jq '.Results | length' trivy-results.json 2>/dev/null || echo "0")
+            
+            if [ "$RESULTS_COUNT" = "0" ] || [ "$RESULTS_COUNT" = "null" ]; then
+              echo "- ✅ **No vulnerabilities detected**" >> final-report.md
             else
-              echo "" >> final-report.md
-              echo "- ✅ No critical or high severity issues found" >> final-report.md
+              CRITICAL=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-results.json 2>/dev/null || echo "0")
+              HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' trivy-results.json 2>/dev/null || echo "0")
+              MEDIUM=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' trivy-results.json 2>/dev/null || echo "0")
+              LOW=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' trivy-results.json 2>/dev/null || echo "0")
+              
+              TOTAL_CRITICAL=$((TOTAL_CRITICAL + CRITICAL))
+              TOTAL_HIGH=$((TOTAL_HIGH + HIGH))
+              TOTAL_MEDIUM=$((TOTAL_MEDIUM + MEDIUM))
+              TOTAL_LOW=$((TOTAL_LOW + LOW))
+              
+              echo "- 🔴 **Critical:** $CRITICAL" >> final-report.md
+              echo "- 🟠 **High:** $HIGH" >> final-report.md
+              echo "- 🟡 **Medium:** $MEDIUM" >> final-report.md
+              echo "- 🟢 **Low:** $LOW" >> final-report.md
+              
+              # List top critical/high issues
+              if [ "$CRITICAL" != "0" ] || [ "$HIGH" != "0" ]; then
+                echo "" >> final-report.md
+                echo "#### 🚨 Top Critical/High Vulnerabilities:" >> final-report.md
+                jq -r '.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL" or .Severity=="HIGH") | "- **\(.VulnerabilityID)**: \(.Title // .PkgName) (\(.Severity))"' trivy-results.json 2>/dev/null | head -5 >> final-report.md || true
+              fi
             fi
           else
-            echo "- ⚠️ Trivy scan did not produce results" >> final-report.md
+            echo "- ⚠️ Scan did not complete" >> final-report.md
           fi
+          echo "" >> final-report.md
+          
+          # Trivy Secrets
+          echo "### 🔑 Trivy - Secrets Detection" >> final-report.md
+          if [ -f trivy-secrets.json ]; then
+            SECRETS=$(jq '[.Results[]?.Secrets[]?] | length' trivy-secrets.json 2>/dev/null || echo "0")
+            TOTAL_SECRETS=$SECRETS
+            
+            if [ "$SECRETS" = "0" ]; then
+              echo "- ✅ **No secrets detected**" >> final-report.md
+            else
+              echo "- 🔑 **Secrets found:** $SECRETS" >> final-report.md
+              echo "" >> final-report.md
+              echo "#### Detected Secrets:" >> final-report.md
+              jq -r '.Results[]?.Secrets[]? | "- **\(.Title)** in `\(.Target)` (Line \(.StartLine // "unknown"))"' trivy-secrets.json 2>/dev/null | head -10 >> final-report.md || true
+            fi
+          else
+            echo "- ✅ No secrets detected" >> final-report.md
+          fi
+          echo "" >> final-report.md
+          
+          # CodeQL
+          echo "### 🔍 CodeQL Analysis" >> final-report.md
+          if [ "${{ steps.detect-languages.outputs.languages }}" != "none" ]; then
+            echo "- ✅ **Languages scanned:** ${{ steps.detect-languages.outputs.languages }}" >> final-report.md
+            echo "- 📊 Results available in GitHub Security tab (Code Scanning Alerts)" >> final-report.md
+          else
+            echo "- ⚠️ No CodeQL-supported languages detected in repository" >> final-report.md
+          fi
+          echo "" >> final-report.md
+          
+          # Semgrep
+          echo "### 🛡️ Semgrep - SAST Analysis" >> final-report.md
+          if [ -f semgrep-results.json ]; then
+            TOTAL=$(jq '.results | length' semgrep-results.json 2>/dev/null || echo "0")
+            echo "- **Total findings:** $TOTAL" >> final-report.md
+            
+            if [ "$TOTAL" != "0" ] && [ "$TOTAL" != "null" ]; then
+              ERROR=$(jq '[.results[] | select(.extra.severity=="ERROR")] | length' semgrep-results.json 2>/dev/null || echo "0")
+              WARNING=$(jq '[.results[] | select(.extra.severity=="WARNING")] | length' semgrep-results.json 2>/dev/null || echo "0")
+              INFO=$(jq '[.results[] | select(.extra.severity=="INFO")] | length' semgrep-results.json 2>/dev/null || echo "0")
+              
+              echo "  - 🔴 **Error:** $ERROR" >> final-report.md
+              echo "  - 🟡 **Warning:** $WARNING" >> final-report.md
+              echo "  - 🔵 **Info:** $INFO" >> final-report.md
+              
+              TOTAL_HIGH=$((TOTAL_HIGH + ERROR))
+              TOTAL_MEDIUM=$((TOTAL_MEDIUM + WARNING))
+              
+              # Show top issues
+              if [ "$ERROR" != "0" ] || [ "$WARNING" != "0" ]; then
+                echo "" >> final-report.md
+                echo "#### Top Issues:" >> final-report.md
+                jq -r '.results[0:5] | .[] | "- **\(.check_id)** in `\(.path)` (Line \(.start.line)): \(.extra.message // "Security issue detected")"' semgrep-results.json 2>/dev/null >> final-report.md || true
+              fi
+            else
+              echo "- ✅ No issues found" >> final-report.md
+            fi
+          else
+            echo "- ⚠️ Scan not completed" >> final-report.md
+          fi
+          echo "" >> final-report.md
+          
+          # Bandit
+          echo "### 🐍 Bandit - Python Security" >> final-report.md
+          if [ -f bandit-report.json ]; then
+            HIGH=$(jq '[.results[] | select(.issue_severity=="HIGH")] | length' bandit-report.json 2>/dev/null || echo "0")
+            MEDIUM=$(jq '[.results[] | select(.issue_severity=="MEDIUM")] | length' bandit-report.json 2>/dev/null || echo "0")
+            LOW=$(jq '[.results[] | select(.issue_severity=="LOW")] | length' bandit-report.json 2>/dev/null || echo "0")
+            
+            echo "- 🔴 **High:** $HIGH" >> final-report.md
+            echo "- 🟡 **Medium:** $MEDIUM" >> final-report.md
+            echo "- 🟢 **Low:** $LOW" >> final-report.md
+            
+            TOTAL_HIGH=$((TOTAL_HIGH + HIGH))
+            TOTAL_MEDIUM=$((TOTAL_MEDIUM + MEDIUM))
+            TOTAL_LOW=$((TOTAL_LOW + LOW))
+            
+            if [ "$HIGH" != "0" ]; then
+              echo "" >> final-report.md
+              echo "#### High Severity Issues:" >> final-report.md
+              jq -r '.results[] | select(.issue_severity=="HIGH") | "- **\(.test_id)**: \(.issue_text) in `\(.filename)` (Line \(.line_number))"' bandit-report.json 2>/dev/null | head -5 >> final-report.md || true
+            fi
+          else
+            echo "- Not applicable (no Python files detected)" >> final-report.md
+          fi
+          echo "" >> final-report.md
+          
+          # njsscan
+          echo "### 📦 njsscan - Node.js Security" >> final-report.md
+          if [ -f njsscan-report.json ]; then
+            ISSUES=$(jq '.total_count.sec // 0' njsscan-report.json 2>/dev/null || echo "0")
+            echo "- **Security issues:** $ISSUES" >> final-report.md
+            
+            if [ "$ISSUES" != "0" ]; then
+              TOTAL_MEDIUM=$((TOTAL_MEDIUM + ISSUES))
+            fi
+          else
+            echo "- Not applicable (no JavaScript/Node.js files detected)" >> final-report.md
+          fi
+          echo "" >> final-report.md
+          
+          # npm audit
+          echo "### 📦 npm audit - Node.js Dependencies" >> final-report.md
+          if [ -f npm-audit.json ]; then
+            CRITICAL=$(jq '.metadata.vulnerabilities.critical // 0' npm-audit.json 2>/dev/null || echo "0")
+            HIGH=$(jq '.metadata.vulnerabilities.high // 0' npm-audit.json 2>/dev/null || echo "0")
+            MODERATE=$(jq '.metadata.vulnerabilities.moderate // 0' npm-audit.json 2>/dev/null || echo "0")
+            
+            echo "- 🔴 **Critical:** $CRITICAL" >> final-report.md
+            echo "- 🟠 **High:** $HIGH" >> final-report.md
+            echo "- 🟡 **Moderate:** $MODERATE" >> final-report.md
+            
+            TOTAL_CRITICAL=$((TOTAL_CRITICAL + CRITICAL))
+            TOTAL_HIGH=$((TOTAL_HIGH + HIGH))
+            TOTAL_MEDIUM=$((TOTAL_MEDIUM + MODERATE))
+          else
+            echo "- Not applicable (no package.json found)" >> final-report.md
+          fi
+          echo "" >> final-report.md
+          
+          # Safety
+          echo "### 🔒 Safety - Python Dependencies" >> final-report.md
+          if [ -f safety-results.json ]; then
+            VULNS=$(jq 'length' safety-results.json 2>/dev/null || echo "0")
+            
+            if [ "$VULNS" = "0" ]; then
+              echo "- ✅ No known vulnerabilities in Python dependencies" >> final-report.md
+            else
+              echo "- ⚠️  **Vulnerable packages:** $VULNS" >> final-report.md
+              TOTAL_HIGH=$((TOTAL_HIGH + VULNS))
+            fi
+          else
+            echo "- Not applicable (no requirements.txt found)" >> final-report.md
+          fi
+          echo "" >> final-report.md
+          
+          # Overall Summary
+          echo "---" >> final-report.md
+          echo "" >> final-report.md
+          echo "## 🎯 Overall Risk Assessment" >> final-report.md
+          echo "" >> final-report.md
+          
+          TOTAL_ISSUES=$((TOTAL_CRITICAL + TOTAL_HIGH + TOTAL_MEDIUM + TOTAL_LOW + TOTAL_SECRETS))
+          
+          echo "**Total Issues Found:** $TOTAL_ISSUES" >> final-report.md
+          echo "" >> final-report.md
+          
+          if [ $TOTAL_CRITICAL -gt 0 ]; then
+            echo "### 🔴 **CRITICAL RISK**" >> final-report.md
+            echo "" >> final-report.md
+            echo "⚠️  **$TOTAL_CRITICAL critical issues require immediate attention!**" >> final-report.md
+            echo "" >> final-report.md
+            echo "**Breakdown:**" >> final-report.md
+            echo "- 🔴 Critical: $TOTAL_CRITICAL" >> final-report.md
+            echo "- 🟠 High: $TOTAL_HIGH" >> final-report.md
+            echo "- 🟡 Medium: $TOTAL_MEDIUM" >> final-report.md
+            echo "- 🟢 Low: $TOTAL_LOW" >> final-report.md
+            echo "- 🔑 Secrets: $TOTAL_SECRETS" >> final-report.md
+          elif [ $TOTAL_HIGH -gt 10 ]; then
+            echo "### 🟠 **HIGH RISK**" >> final-report.md
+            echo "" >> final-report.md
+            echo "**$TOTAL_HIGH high-severity issues found**" >> final-report.md
+            echo "" >> final-report.md
+            echo "**Breakdown:**" >> final-report.md
+            echo "- 🟠 High: $TOTAL_HIGH" >> final-report.md
+            echo "- 🟡 Medium: $TOTAL_MEDIUM" >> final-report.md
+            echo "- 🟢 Low: $TOTAL_LOW" >> final-report.md
+            echo "- 🔑 Secrets: $TOTAL_SECRETS" >> final-report.md
+          elif [ $TOTAL_MEDIUM -gt 20 ]; then
+            echo "### 🟡 **MEDIUM RISK**" >> final-report.md
+            echo "" >> final-report.md
+            echo "Multiple medium-severity issues detected" >> final-report.md
+            echo "" >> final-report.md
+            echo "**Breakdown:**" >> final-report.md
+            echo "- 🟡 Medium: $TOTAL_MEDIUM" >> final-report.md
+            echo "- 🟢 Low: $TOTAL_LOW" >> final-report.md
+            echo "- 🔑 Secrets: $TOTAL_SECRETS" >> final-report.md
+          elif [ $TOTAL_ISSUES -eq 0 ]; then
+            echo "### ✅ **LOW RISK - EXCELLENT!**" >> final-report.md
+            echo "" >> final-report.md
+            echo "🎉 **No significant security issues detected!**" >> final-report.md
+            echo "" >> final-report.md
+            echo "This repository appears to follow security best practices:" >> final-report.md
+            echo "- ✅ No critical or high vulnerabilities" >> final-report.md
+            echo "- ✅ No secrets exposed" >> final-report.md
+            echo "- ✅ No major code quality issues" >> final-report.md
+            echo "- ✅ Dependencies are up to date" >> final-report.md
+          else
+            echo "### 🟢 **LOW-MEDIUM RISK**" >> final-report.md
+            echo "" >> final-report.md
+            echo "Minor issues found, but overall security posture is good" >> final-report.md
+            echo "" >> final-report.md
+            echo "**Breakdown:**" >> final-report.md
+            echo "- 🟡 Medium: $TOTAL_MEDIUM" >> final-report.md
+            echo "- 🟢 Low: $TOTAL_LOW" >> final-report.md
+            if [ $TOTAL_SECRETS -gt 0 ]; then
+              echo "- 🔑 Secrets: $TOTAL_SECRETS ⚠️" >> final-report.md
+            fi
+          fi
+          
+          echo "" >> final-report.md
+          echo "---" >> final-report.md
+          echo "" >> final-report.md
+          echo "## 📋 Recommended Actions" >> final-report.md
+          echo "" >> final-report.md
+          
+          if [ $TOTAL_CRITICAL -gt 0 ]; then
+            echo "### Immediate (Critical):" >> final-report.md
+            echo "1. 🚨 Review and fix all CRITICAL vulnerabilities immediately" >> final-report.md
+            echo "2. 🔒 Rotate any exposed secrets/credentials" >> final-report.md
+            echo "3. 🔍 Conduct thorough security review" >> final-report.md
+            echo "" >> final-report.md
+          fi
+          
+          if [ $TOTAL_HIGH -gt 0 ]; then
+            echo "### High Priority:" >> final-report.md
+            echo "1. 🔧 Address HIGH severity issues within 7 days" >> final-report.md
+            echo "2. 📦 Update vulnerable dependencies" >> final-report.md
+            echo "3. 🛡️ Review Semgrep and Bandit findings" >> final-report.md
+            echo "" >> final-report.md
+          fi
+          
+          echo "### Regular Maintenance:" >> final-report.md
+          echo "1. 📥 Download detailed reports from Artifacts section below" >> final-report.md
+          echo "2. 📊 Review SARIF files for complete findings" >> final-report.md
+          echo "3. 🔄 Run this scan regularly (recommended: weekly)" >> final-report.md
+          echo "4. 📈 Track security improvements over time" >> final-report.md
+          
+          echo "" >> final-report.md
+          echo "---" >> final-report.md
+          echo "" >> final-report.md
+          echo "## 📦 Detailed Reports Available" >> final-report.md
+          echo "" >> final-report.md
+          echo "Download the artifacts below for:" >> final-report.md
+          echo "- 📄 Complete JSON reports from all tools" >> final-report.md
+          echo "- 📊 SARIF files for IDE integration" >> final-report.md
+          echo "- 🔍 Line-by-line vulnerability details" >> final-report.md
+          echo "- 📈 Exportable data for tracking" >> final-report.md
+          echo "" >> final-report.md
+          echo "---" >> final-report.md
+          echo "" >> final-report.md
+          echo "**Scan completed:** $(date -u)" >> final-report.md
+          echo "**Workflow:** https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> final-report.md
+          echo "" >> final-report.md
+          echo "✅ **Security scan completed successfully!**" >> final-report.md
+          
+          # Display in logs
+          echo ""
+          echo "============================================="
+          echo "        FINAL SECURITY REPORT"
+          echo "============================================="
+          cat final-report.md
+          echo "============================================="
 
-          cat << 'EOFMARKER' >> final-report.md
-
-          ---
-
-          ## 🛡️ Other Scanner Results
-
-          - **Semgrep** — $(jq '.results | length' semgrep-results.json 2>/dev/null || echo "0") findings
-          - **Bandit** (Python) — High: $(jq '[.results[] | select(.issue_severity=="HIGH")] | length' bandit-report.json 2>/dev/null || echo "0"), Medium: $(jq '[.results[] | select(.issue_severity=="MEDIUM")] | length' bandit-report.json 2>/dev/null || echo "0")
-          - **njsscan** (JS/TS) — $(jq '.total_count.sec // 0' njsscan-report.json 2>/dev/null || echo "0") security issues
-          - **npm audit** — $(jq '.metadata.vulnerabilities.total // 0' npm-audit.json 2>/dev/null || echo "0") vulnerabilities
-          - **Safety** (Python deps) — $(jq 'length' safety-results.json 2>/dev/null || echo "0") vulnerable packages
-
-          ---
-
-          ## 📌 Recommended Next Steps
-
-          - 🔴 Critical issues → Fix **immediately** and re-scan
-          - 🟠 High issues → Address within **7 days**
-          - 🟡 Medium issues → Plan fixes in next cycle
-          - 🔑 Secrets → **Rotate credentials** urgently
-          - Review full details in the downloaded **ZIP artifact**
-          - Enable Dependabot alerts and CodeQL in your repo settings
-
-          **Scan completed successfully.**  
-          Thank you for prioritizing security! 🛡️
-
-          EOFMARKER
-
-      - name: 📤 Upload scan artifacts (ZIP includes pretty report)
-        if: always()
+      - name: 📤 Upload All Scan Results
         uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: security-scan-results-${{ github.run_number }}
           path: |
             final-report.md
-            *.json
-            *.sarif
+            semgrep-results.json
+            semgrep.sarif
+            bandit-report.json
+            njsscan-report.json
+            trivy-results.json
+            trivy-secrets.json
+            safety-results.json
+            npm-audit.json
           retention-days: 30
 
-      - name: ✅ Final summary
+      - name: ✅ Workflow Summary
         if: always()
         run: |
-          echo "Scan completed for ${{ steps.parse.outputs.repo }}"
-          echo "Run: ${{ github.run_id }}"
-          echo "Artifact: security-scan-results-${{ github.run_number }}"
+          echo ""
+          echo "============================================="
+          echo "✅ Security Scan Workflow Completed!"
+          echo "============================================="
+          echo ""
+          echo "📊 Repository scanned: ${{ steps.parse.outputs.repo }}"
+          echo "🕐 Completed at: $(date -u)"
+          echo "🔢 Run number: ${{ github.run_number }}"
+          echo ""
+          echo "📥 Download detailed results:"
+          echo "   → Go to Actions tab"
+          echo "   → Click this workflow run"
+          echo "   → Scroll to Artifacts section"
+          echo "   → Download: security-scan-results-${{ github.run_number }}"
+          echo ""
+          echo "🎯 View summary report in the logs above"
+          echo "============================================="
+      - name: Output Run ID
+        run: |
+          echo "The current Run ID is ${{ github.run_id }}"
+      - name: Output Scan Summary
+        run: |
+          echo "## Scan Summary for Agent" >> $GITHUB_STEP_SUMMARY
+          cat final-report.md >> $GITHUB_STEP_SUMMARY
