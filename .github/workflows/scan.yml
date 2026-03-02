@@ -115,68 +115,113 @@ jobs:
           npm install --package-lock-only --no-audit --no-fund --quiet || true
           npm audit --json > ../npm-audit.json || true
           cd ..
-
       # ────────────────────────────────────────────────
-      # CRITICAL: Send fast callback to agent FIRST
+      # Pretty final report (after callback – no timeout impact)
       # ────────────────────────────────────────────────
-      - name: 📤 Send minimal result to agent callback
-        if: |
-          always() &&
-          github.event_name == 'repository_dispatch' &&
-          github.event.client_payload.callback_url != ''
-        run: |
-          CRITICAL=0 HIGH=0 MEDIUM=0 LOW=0 SECRETS=0 TOTAL=0
-
-          if [ -f trivy-combined.json ]; then
-            CRITICAL=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-combined.json 2>/dev/null || echo 0)
-            HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' trivy-combined.json 2>/dev/null || echo 0)
-            MEDIUM=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' trivy-combined.json 2>/dev/null || echo 0)
-            LOW=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' trivy-combined.json 2>/dev/null || echo 0)
-            SECRETS=$(jq '[.Results[]?.Secrets[]?] | length' trivy-combined.json 2>/dev/null || echo 0)
-          fi
-
-          TOTAL=$((CRITICAL + HIGH + MEDIUM + LOW + SECRETS))
-
-          cat > result.json << JSON
-          {
-            "request_id": "${{ github.event.client_payload.request_id }}",
-            "status": "${{ job.status }}",
-            "run_url": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}",
-            "artifact_name": "security-scan-results-${{ github.run_number }}",
-            "critical": "$CRITICAL",
-            "high": "$HIGH",
-            "medium": "$MEDIUM",
-            "low": "$LOW",
-            "secrets": "$SECRETS",
-            "total_issues": "$TOTAL"
-          }
-          JSON
-
-          curl -X POST "${{ github.event.client_payload.callback_url }}" \
-            -H "Content-Type: application/json" \
-            -d @result.json --fail --silent || echo "Callback failed (non-blocking)"
-
-      # ────────────────────────────────────────────────
-      # Heavy work AFTER callback (no impact on agent timeout)
-      # ────────────────────────────────────────────────
-      - name: 📝 Generate full report
+      - name: 📝 Generate pretty final report
         if: always()
         run: |
-          # Paste your original full report generation script here
-          # (the long cat << 'EOFMARKER' > final-report.md block)
-          # For space reasons it's not repeated in this answer,
-          # but keep your existing report logic exactly as it was.
-          # Just move it into this step.
+          cat << 'EOFMARKER' > final-report.md
+          # 🔒 Security & Quality Scan Report
 
-      - name: 📤 Upload scan artifacts
+          **Repository** — ${{ steps.parse.outputs.repo }}  
+          **Scanned URL** — ${{ steps.parse.outputs.url }}  
+          **Scan Date** — $(date -u +"%Y-%m-%d %H:%M:%S UTC")  
+          **Workflow Run** — [#${{ github.run_number }}](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})  
+          **Triggered by** — ${{ github.event_name }}
+
+          ---
+
+          ## 🎯 Executive Summary
+
+          | Risk Level       | Total Issues | Critical | High | Medium | Low | Secrets |
+          |------------------|--------------|----------|------|--------|-----|---------|
+          | **Overall**      | ${{ env.TOTAL_ISSUES:-0 }} | ${{ env.CRITICAL:-0 }} | ${{ env.HIGH:-0 }} | ${{ env.MEDIUM:-0 }} | ${{ env.LOW:-0 }} | ${{ env.SECRETS:-0 }} |
+
+          **Risk Assessment**:
+          EOFMARKER
+
+          if [ "${{ env.CRITICAL:-0 }}" -gt 0 ]; then
+            echo "- 🔴 **CRITICAL RISK** — Immediate action required" >> final-report.md
+          elif [ "${{ env.HIGH:-0 }}" -gt 10 ]; then
+            echo "- 🟠 **HIGH RISK** — Address high-severity issues urgently" >> final-report.md
+          elif [ "${{ env.MEDIUM:-0 }}" -gt 20 ] || [ "${{ env.SECRETS:-0 }}" -gt 0 ]; then
+            echo "- 🟡 **MEDIUM RISK** — Review recommended" >> final-report.md
+          else
+            echo "- ✅ **LOW RISK** — Repository appears in good shape" >> final-report.md
+          fi
+
+          cat << 'EOFMARKER' >> final-report.md
+
+          ---
+
+          ## 🔐 Trivy Scan Results (Vulnerabilities + Secrets + Misconfigurations)
+
+          EOFMARKER
+
+          if [ -f trivy-combined.json ] && [ -s trivy-combined.json ]; then
+            CRIT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-combined.json 2>/dev/null || echo 0)
+            HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' trivy-combined.json 2>/dev/null || echo 0)
+            MED=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' trivy-combined.json 2>/dev/null || echo 0)
+            LOW=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' trivy-combined.json 2>/dev/null || echo 0)
+            SEC=$(jq '[.Results[]?.Secrets[]?] | length' trivy-combined.json 2>/dev/null || echo 0)
+
+            cat << EOF >> final-report.md
+          - Critical   : $CRIT  
+          - High       : $HIGH  
+          - Medium     : $MED  
+          - Low        : $LOW  
+          - Secrets    : $SEC  
+
+          EOF
+
+            if [ "$CRIT" -gt 0 ] || [ "$HIGH" -gt 0 ]; then
+              echo "#### Top Critical / High Issues (first 5)" >> final-report.md
+              jq -r '.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL" or .Severity=="HIGH") | "- **\(.VulnerabilityID)** – \(.Title // .PkgName) (\(.Severity)) in \(.PkgName)"' trivy-combined.json 2>/dev/null | head -5 >> final-report.md || echo "- (details parsing failed)" >> final-report.md
+            else
+              echo "- ✅ No critical or high severity issues found" >> final-report.md
+            fi
+          else
+            echo "- ⚠️ Trivy scan did not produce results" >> final-report.md
+          fi
+
+          cat << 'EOFMARKER' >> final-report.md
+
+          ---
+
+          ## 🛡️ Other Scanner Results
+
+          - **Semgrep**: $(jq '.results | length' semgrep-results.json 2>/dev/null || echo "0") findings
+          - **Bandit** (Python): $(jq '[.results[] | select(.issue_severity=="HIGH")] | length' bandit-report.json 2>/dev/null || echo "0") high, $(jq '[.results[] | select(.issue_severity=="MEDIUM")] | length' bandit-report.json 2>/dev/null || echo "0") medium
+          - **njsscan** (JS/TS): $(jq '.total_count.sec // 0' njsscan-report.json 2>/dev/null || echo "0") security issues
+          - **npm audit**: $(jq '.metadata.vulnerabilities.total // 0' npm-audit.json 2>/dev/null || echo "0") vulnerabilities
+          - **Safety** (Python deps): $(jq 'length' safety-results.json 2>/dev/null || echo "0") vulnerable packages
+
+          ---
+
+          ## 📌 Recommended Next Steps
+
+          - 🔴 Critical issues → **fix immediately** and re-scan
+          - 🟠 High issues → address within **7 days**
+          - 🟡 Medium issues → plan fixes in next sprint
+          - 🔑 Any secrets → **rotate credentials** urgently
+          - Download full details from **Artifacts** in this run
+          - Consider adding **Dependabot** or **CodeQL** alerts in repo settings
+
+          **Scan completed successfully.**  
+          Thank you for keeping your code secure! 🛡️
+
+          EOFMARKER
+
+      - name: 📤 Upload scan artifacts (including pretty report)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: security-scan-results-${{ github.run_number }}
           path: |
+            final-report.md
             *.json
             *.sarif
-            final-report.md
           retention-days: 30
 
       - name: ✅ Final summary
