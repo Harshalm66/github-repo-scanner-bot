@@ -153,6 +153,18 @@ jobs:
             -H "Content-Type: application/json" \
             -d @result.json --fail --silent || echo "Callback failed (non-blocking)"
 
+      # ────────────────────────────────────────────────
+      # Set fallback values (0) for report summary
+      # ────────────────────────────────────────────────
+      - name: Set summary counts for report
+        run: |
+          echo "TOTAL_ISSUES=${TOTAL:-0}" >> $GITHUB_ENV
+          echo "CRITICAL=${CRITICAL:-0}" >> $GITHUB_ENV
+          echo "HIGH=${HIGH:-0}" >> $GITHUB_ENV
+          echo "MEDIUM=${MEDIUM:-0}" >> $GITHUB_ENV
+          echo "LOW=${LOW:-0}" >> $GITHUB_ENV
+          echo "SECRETS=${SECRETS:-0}" >> $GITHUB_ENV
+
       - name: 📝 Generate pretty final report
         if: always()
         run: |
@@ -171,21 +183,21 @@ jobs:
 
           | Category         | Count       |
           |------------------|-------------|
-          | Total Issues     | ${{ env.TOTAL_ISSUES:-0 }} |
-          | Critical         | ${{ env.CRITICAL:-0 }}     |
-          | High             | ${{ env.HIGH:-0 }}         |
-          | Medium           | ${{ env.MEDIUM:-0 }}       |
-          | Low              | ${{ env.LOW:-0 }}          |
-          | Secrets Detected | ${{ env.SECRETS:-0 }}      |
+          | Total Issues     | ${{ env.TOTAL_ISSUES }} |
+          | Critical         | ${{ env.CRITICAL }}     |
+          | High             | ${{ env.HIGH }}         |
+          | Medium           | ${{ env.MEDIUM }}       |
+          | Low              | ${{ env.LOW }}          |
+          | Secrets Detected | ${{ env.SECRETS }}      |
 
           **Risk Level**:
           EOFMARKER
 
-          if [ "${{ env.CRITICAL:-0 }}" -gt 0 ]; then
+          if [ "${{ env.CRITICAL }}" -gt 0 ]; then
             echo "- 🔴 **CRITICAL RISK** — Immediate action required" >> final-report.md
-          elif [ "${{ env.HIGH:-0 }}" -gt 10 ]; then
+          elif [ "${{ env.HIGH }}" -gt 10 ]; then
             echo "- 🟠 **HIGH RISK** — Address high-severity issues urgently" >> final-report.md
-          elif [ "${{ env.MEDIUM:-0 }}" -gt 20 ] || [ "${{ env.SECRETS:-0 }}" -gt 0 ]; then
+          elif [ "${{ env.MEDIUM }}" -gt 20 ] || [ "${{ env.SECRETS }}" -gt 0 ]; then
             echo "- 🟡 **MEDIUM RISK** — Review recommended" >> final-report.md
           else
             echo "- ✅ **LOW RISK** — Repository appears secure" >> final-report.md
