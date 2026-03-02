@@ -3,22 +3,22 @@ name: Scan Repository
 on:
   repository_dispatch:
     types: [process-url]
- 
+
   workflow_dispatch:
     inputs:
       repo_url:
-        description: 'GitHub Repository URL or owner/repo (https://github.com/owner/repo  or  owner/repo)'
+        description: GitHub Repository URL or owner/repo
         required: true
-        default: 'https://github.com/lodash/lodash'
+        default: https://github.com/lodash/lodash
         type: string
 
 jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-   
+
     steps:
-      - name: 📋 Parse Repository URL
+      - name: Parse Repository URL
         id: parse
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
@@ -26,8 +26,6 @@ jobs:
           else
             INPUT_URL="${{ github.event.client_payload.repo_url }}"
           fi
-
-          echo "Input URL: $INPUT_URL"
 
           CLEAN=$(echo "$INPUT_URL" \
             | sed -E 's#^https?://(www\.)?github\.com/##' \
@@ -37,31 +35,22 @@ jobs:
           OWNER=$(echo "$CLEAN" | cut -d'/' -f1)
           REPO_NAME=$(echo "$CLEAN" | cut -d'/' -f2 -s)
 
-          if [[ -z "$REPO_NAME" ]]; then
-            echo "❌ Invalid GitHub repository format"
+          if [ -z "$REPO_NAME" ]; then
+            echo "Invalid repository format. Use owner/repo"
             exit 1
           fi
 
-          REPO="$OWNER/$REPO_NAME"
-
-          echo "repo=$REPO" >> $GITHUB_OUTPUT
+          echo "repo=$OWNER/$REPO_NAME" >> $GITHUB_OUTPUT
           echo "url=$INPUT_URL" >> $GITHUB_OUTPUT
 
-      - name: 🔽 Clone Target Repository
+      - name: Clone Target Repository
         uses: actions/checkout@v4
         with:
           repository: ${{ steps.parse.outputs.repo }}
           path: target-repo
           fetch-depth: 0
 
-      - name: 📊 Repository Information
-        run: |
-          cd target-repo
-          echo "📦 Total files: $(find . -type f | wc -l)"
-          cd ..
-
-      # ✅ Language detection kept
-      - name: 🔍 Detect Languages
+      - name: Detect Languages
         id: detect-languages
         run: |
           cd target-repo
@@ -101,8 +90,7 @@ jobs:
             echo "languages=$LANGUAGES" >> $GITHUB_OUTPUT
           fi
 
-      # 🛡️ Semgrep
-      - name: 🛡️ Run Semgrep
+      - name: Run Semgrep
         continue-on-error: true
         run: |
           pip install semgrep
@@ -111,46 +99,41 @@ jobs:
           semgrep --config=auto --sarif --output=../semgrep.sarif . || true
           cd ..
 
-      # 🐍 Bandit
-      - name: 🐍 Run Bandit (Python Security)
+      - name: Run Bandit
         if: contains(steps.detect-languages.outputs.languages, 'python')
         continue-on-error: true
         run: |
           pip install bandit
           bandit -r target-repo -f json -o bandit-report.json || true
 
-      # 📦 njsscan
-      - name: 📦 Run njsscan (Node.js Security)
+      - name: Run njsscan
         if: contains(steps.detect-languages.outputs.languages, 'javascript')
         continue-on-error: true
         run: |
           pip install njsscan
           njsscan target-repo --json --output njsscan-report.json || true
 
-      # 🔐 Trivy Vulnerabilities
-      - name: 🔐 Run Trivy (Vulnerabilities)
+      - name: Run Trivy (Vulnerabilities)
         uses: aquasecurity/trivy-action@master
         continue-on-error: true
         with:
-          scan-type: 'fs'
-          scan-ref: 'target-repo'
-          format: 'json'
-          output: 'trivy-results.json'
-          severity: 'CRITICAL,HIGH,MEDIUM,LOW'
+          scan-type: fs
+          scan-ref: target-repo
+          format: json
+          output: trivy-results.json
+          severity: CRITICAL,HIGH,MEDIUM,LOW
 
-      # 🔐 Trivy Secrets
-      - name: 🔐 Run Trivy (Secrets)
+      - name: Run Trivy (Secrets)
         uses: aquasecurity/trivy-action@master
         continue-on-error: true
         with:
-          scan-type: 'fs'
-          scan-ref: 'target-repo'
-          scanners: 'secret'
-          format: 'json'
-          output: 'trivy-secrets.json'
+          scan-type: fs
+          scan-ref: target-repo
+          scanners: secret
+          format: json
+          output: trivy-secrets.json
 
-      # 🔒 Safety
-      - name: 🔒 Run Safety (Python Dependencies)
+      - name: Run Safety
         if: contains(steps.detect-languages.outputs.languages, 'python')
         continue-on-error: true
         run: |
@@ -159,8 +142,7 @@ jobs:
             safety check --file target-repo/requirements.txt --json > safety-results.json || true
           fi
 
-      # 📦 npm audit
-      - name: 📦 Run npm audit
+      - name: Run npm audit
         if: contains(steps.detect-languages.outputs.languages, 'javascript')
         continue-on-error: true
         run: |
@@ -171,19 +153,17 @@ jobs:
             cd ..
           fi
 
-      - name: 📝 Generate Final Report
+      - name: Generate Final Report
         if: always()
         run: |
-          echo "# 🔒 Security & Quality Scan Report" > final-report.md
+          echo "# Security Scan Report" > final-report.md
           echo "" >> final-report.md
-          echo "**Repository:** ${{ steps.parse.outputs.repo }}" >> final-report.md
-          echo "**Scanned:** $(date -u)" >> final-report.md
+          echo "Repository: ${{ steps.parse.outputs.repo }}" >> final-report.md
+          echo "Scanned at: $(date -u)" >> final-report.md
           echo "" >> final-report.md
-          echo "CodeQL scanning has been removed from this workflow." >> final-report.md
-          echo "" >> final-report.md
-          echo "Detailed JSON reports are available in artifacts." >> final-report.md
+          echo "Detailed JSON reports are available in workflow artifacts." >> final-report.md
 
-      - name: 📤 Upload All Scan Results
+      - name: Upload Scan Results
         uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -201,7 +181,8 @@ jobs:
           retention-days: 30
 
       - name: Output Run ID
-        run: echo "Run ID: ${{ github.run_id }}"
+        run: |
+          echo "Run ID: ${{ github.run_id }}"
 
       - name: Output Scan Summary
         if: always()
