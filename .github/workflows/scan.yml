@@ -494,7 +494,7 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: security-scan-results-${{ github.run_number }}
+          name: security-scan-results
           path: |
             final-report.md
             semgrep-results.json
